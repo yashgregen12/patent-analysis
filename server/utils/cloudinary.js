@@ -15,8 +15,7 @@ const uploadToCloudinary = async (localFilePath) => {
 
         // Check if file exists before uploading
         if (!fs.existsSync(localFilePath)) {
-            console.error(`File does not exist: ${localFilePath}`);
-            return null;
+            throw new Error(`File not found: ${localFilePath}`);
         }
 
         //upload the file on cloudinary
@@ -24,9 +23,8 @@ const uploadToCloudinary = async (localFilePath) => {
             resource_type: "auto",
         });
 
-        if(response.error) {
-            console.error("Error uploading file to Cloudinary:", response.error);
-            return null;
+        if (response.error) {
+            throw new Error("Error uploading file to Cloudinary:", response.error);
         }
 
         console.log("File uploaded successfully:", JSON.stringify(response));
@@ -36,9 +34,8 @@ const uploadToCloudinary = async (localFilePath) => {
         fs.unlinkSync(localFilePath);
         return response;
     } catch (error) {
-        fs.unlinkSync(localFilePath);
-        console.error("Error uploading file to Cloudinary:", error);
-        return null;
+        fs.existsSync(localFilePath) && fs.unlinkSync(localFilePath);
+        throw error;
     }
 };
 

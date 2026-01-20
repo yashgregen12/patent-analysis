@@ -131,7 +131,7 @@ export const getAllIPs = async (req, res) => {
     try {
         const attorney = req.user;
         const ips = await IP.find({ reviewer: attorney._id })
-            .populate('creator', 'email users applicationNumber')
+            .populate('creator', 'name email applicationNumber')
             .sort({ updatedAt: -1 });
         return res.status(200).json({ success: true, data: ips });
     } catch (error) {
@@ -143,7 +143,7 @@ export const getAllIPs = async (req, res) => {
 export const getIPById = async (req, res) => {
     try {
         const { id } = req.params;
-        const ip = await IP.findById(id).populate('creator', 'email users applicationNumber').populate('chats.user', 'name email role');
+        const ip = await IP.findById(id).populate('creator', 'name email applicationNumber').populate('chats.user', 'name email role');
         if (!ip) {
             return res.status(404).json({ success: false, message: 'IP not found' });
         }

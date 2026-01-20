@@ -1,48 +1,50 @@
-/**
- * Extracts patent citations (US, EP, WO, etc.) from raw text using regex.
- */
 export function extractCitations(text) {
     if (!text) return [];
 
-    const citations = new Set();
+    const map = new Map();
 
-    // US Patents: US 1,234,567 or US1234567 or US-1234567
-    const usRegex = /US\s?([0-9,]{6,10})/gi;
-
-    // EP Patents: EP 1,234,567 or EP1234567
-    const epRegex = /EP\s?([0-0,]{7,10})/gi;
-
-    // WO (PCT) Publications: WO 2024/123456 or WO2024123456
-    const woRegex = /WO\s?([0-9/]{10,12})/gi;
-
-    let match;
-
-    while ((match = usRegex.exec(text)) !== null) {
-        citations.add({
+    const patterns = [
+        {
             type: 'US',
-            number: match[1].replace(/,/g, ''),
-            raw: match[0],
-            url: `https://patents.google.com/patent/US${match[1].replace(/,/g, '')}`
-        });
-    }
-
-    while ((match = epRegex.exec(text)) !== null) {
-        citations.add({
+            regex: /US\s?-?\s?([0-9,]{6,10})/gi,
+            url: n => `https://patents.google.com/patent/US${n}`
+        },
+        {
             type: 'EP',
-            number: match[1].replace(/,/g, ''),
-            raw: match[0],
-            url: `https://patents.google.com/patent/EP${match[1].replace(/,/g, '')}`
-        });
-    }
-
-    while ((match = woRegex.exec(text)) !== null) {
-        citations.add({
+            regex: /EP\s?-?\s?([0-9,]{6,10})/gi,
+            url: n => `https://patents.google.com/patent/EP${n}`
+        },
+        {
             type: 'WO',
-            number: match[1].replace(/[\/,]/g, ''),
-            raw: match[0],
-            url: `https://patents.google.com/patent/WO${match[1].replace(/[\/,]/g, '')}`
-        });
+            regex: /WO\s?-?\s?([0-9/]{6,12})/gi,
+            url: n => `https://patents.google.com/patent/WO${n.replace('/', '')}`
+        },
+        {
+            // 🇮🇳 India patents
+            type: 'IN',
+            regex: /IN\s?-?\s?([0-9]{3,5}(?:\/[A-Z]{3}\/[0-9]{4})|[0-9]{6,15})\s?[A-Z]?/gi,
+            url: n => {
+                const clean = n.replace(/[^0-9]/g, '');
+                return `https://patents.google.com/patent/IN${clean}`;
+            }
+        }
+    ];
+
+    for (const { type, regex, url } of patterns) {
+        let match;
+        while ((match = regex.exec(text)) !== null) {
+            const num = match[1].replace(/[,/]/g, '');
+            const key = `${type}-${num}`;
+            if (!map.has(key)) {
+                map.set(key, {
+                    type,
+                    number: num,
+                    raw: match[0],
+                    url: url(match[1])
+                });
+            }
+        }
     }
 
-    return Array.from(citations);
+    return Array.from(map.values());
 }

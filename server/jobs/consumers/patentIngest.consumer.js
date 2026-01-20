@@ -1,4 +1,8 @@
-import IP, { updateIngestionStatus, addRawContent } from '../../models/ip.model.js';
+import IP, {
+    updateIngestionStatus,
+    addRawContent
+} from '../../models/ip.model.js';
+
 import { extractText } from '../../services/extraction/pdfTextExtractor.service.js';
 import { extractImages } from '../../services/extraction/diagramExtractor.service.js';
 import {
@@ -7,47 +11,79 @@ import {
     expandClaim,
     chunkDescription
 } from '../../services/claims/claimProcessor.js';
+
 import { extractCitations } from '../../services/extraction/citationExtractor.service.js';
 import { analyzeDiagram } from '../../services/ai/diagramIntelligence.service.js';
-import { storeVector, storeBatchVectors } from '../../services/vector/vectorStore.service.js';
+import {
+    storeVector,
+    storeBatchVectors,
+    buildPayload
+} from '../../services/vector/vectorStore.service.js';
+
 import { fetch } from '../../utils/fetcher.js';
+import { ACTIVE_EMBEDDING } from '../../utils/embeddingConfig.js';
+
+const EMBEDDING_VERSION = ACTIVE_EMBEDDING.version;
+const DIAGRAM_CONFIDENCE_THRESHOLD = 0.6;
 
 export async function handlePatentIngest(job) {
-    const ipId = job.ipId;
-    const ip = await IP.findById(ipId);
 
+    if (EMBEDDING_VERSION !== ACTIVE_EMBEDDING.version) {
+        throw new Error('Embedding version mismatch');
+    }
+
+    const { ipId } = job;
+
+    const ip = await IP.findById(ipId);
     if (!ip) {
-        console.error(`IP ${ipId} not found`);
+        console.error(`[INGEST] IP ${ipId} not found`);
         return;
     }
-    
-    await updateIngestionStatus(ipId, 'INGESTING');
-    const ipcClass = ip.ipcClass;
+
+    if (ip.ingestion.status === 'INDEXED') {
+        console.log(`[INGEST] IP ${ipId} already indexed`);
+        return;
+    }
 
     try {
-        console.log(`[INGEST] Starting extraction for IP: ${ip.title}`);
+        /* =========================
+           STEP 1 — INGESTION START
+        ========================= */
 
-        // 1. Fetch buffers from Cloudinary
-        const [abstract, claims, desc, diagrams] = await Promise.all([
-            ip.abstract?.secure_url ? fetch(ip.abstract.secure_url) : Promise.resolve(null),
-            ip.claims?.secure_url ? fetch(ip.claims.secure_url) : Promise.resolve(null),
-            ip.description?.secure_url ? fetch(ip.description.secure_url) : Promise.resolve(null),
-            ip.diagrams?.secure_url ? fetch(ip.diagrams.secure_url) : Promise.resolve(null),
+        await updateIngestionStatus(ipId, 'INGESTING');
+
+        const ipcClass =
+            ip.ipc?.source === 'AI' && ip.ipc.confidence < 0.6
+                ? null
+                : ip.ipc?.class || null;
+        const ingestionVersion = ip.ingestion.version;
+
+        /* =========================
+           STEP 2 — FETCH PDF BUFFERS
+        ========================= */
+
+        const [
+            abstractBuf,
+            claimsBuf,
+            descBuf,
+            diagramBuf
+        ] = await Promise.all([
+            ip.abstract?.secure_url ? fetch(ip.abstract.secure_url) : null,
+            ip.claims?.secure_url ? fetch(ip.claims.secure_url) : null,
+            ip.description?.secure_url ? fetch(ip.description.secure_url) : null,
+            ip.diagrams?.secure_url ? fetch(ip.diagrams.secure_url) : null
         ]);
-        console.log("abstract", abstract, " and type is ", typeof abstract);
-        console.log("claims", claims, " and type is ", typeof claims);
-        console.log("desc", desc, " and type is ", typeof desc);
-        console.log("diagrams", diagrams, " and type is ", typeof diagrams);
 
-        // 2. Extract content
-        console.log(`[INGEST] Extracting text and images...`);
-        const abstractText = abstract ? await extractText(abstract) : '';
-        const claimsText = claims ? await extractText(claims) : '';
-        const descriptionText = desc ? await extractText(desc) : '';
-        const diagramImages = diagrams ? await extractImages(diagrams) : [];
+        /* =========================
+           STEP 3 — RAW EXTRACTION
+        ========================= */
 
-        // 3. Store raw content
-        const citations = extractCitations(descriptionText + " " + claimsText);
+        const abstractText = abstractBuf ? await extractText(abstractBuf) : '';
+        const claimsText = claimsBuf ? await extractText(claimsBuf) : '';
+        const descriptionText = descBuf ? await extractText(descBuf) : '';
+        const diagramImages = diagramBuf ? await extractImages(diagramBuf) : [];
+
+        const citations = extractCitations(`${claimsText} ${descriptionText}`);
 
         await addRawContent(ipId, {
             abstractText,
@@ -57,89 +93,164 @@ export async function handlePatentIngest(job) {
             citations
         });
 
-        // 4. Initial Claims & Description Analysis
-        console.log(`[INGEST] Normalizing claims and chunking description...`);
+        await updateIngestionStatus(ipId, 'RAW_EXTRACTED');
 
-        // Parse claims and identify dependencies
-        const rawClaims = parseClaims(claimsText);
-        rawClaims.forEach(c => {
+        /* =========================
+           STEP 4 — CLAIM PROCESSING
+        ========================= */
+
+        const parsedClaims = parseClaims(claimsText);
+
+        parsedClaims.forEach(c => {
             c.dependsOn = extractDependencies(c.text);
         });
 
-        const claimMap = new Map(rawClaims.map(c => [c.claimNo, c]));
+        const claimMap = new Map(parsedClaims.map(c => [c.claimNo, c]));
 
-        // Expand claims recursively
-        const expandedClaims = rawClaims.map(c => ({
-            ...c,
-            expandedText: expandClaim(c, claimMap)
+        const expandedClaims = parsedClaims.map(c => ({
+            claimNo: c.claimNo,
+            dependsOn: c.dependsOn,
+            text: c.text,
+            expandedText: expandClaim(c, claimMap),
+            isExpanded: true
         }));
 
-        // Semantic chunking of description
-        const descriptionChunks = chunkDescription(descriptionText);
+        const descriptionChunks = chunkDescription(descriptionText).map(
+            (text, i) => ({
+                chunkId: `${ipId}_desc_${i}`,
+                text
+            })
+        );
 
-        // 5. Diagram Intelligence
-        console.log(`[INGEST] Identifying diagram intelligence...`);
-        const structuredDiagrams = [];
-        for (const img of diagramImages) {
-            if (img.secure_url) {
-                const intelligence = await analyzeDiagram(img.secure_url);
-                structuredDiagrams.push({
-                    type: intelligence.type || "unknown",
-                    representation: intelligence,
-                    semanticSummary: intelligence.semanticSummary || ""
-                });
-            }
-        }
-
-        // Update structured content directly on IP
         await IP.findByIdAndUpdate(ipId, {
-            'structured.claims': expandedClaims,
-            'structured.descriptionChunks': descriptionChunks,
-            'structured.diagrams': structuredDiagrams,
-            ingestionStatus: 'PROCESSED'
+            'ingestion.structured.claims': expandedClaims,
+            'ingestion.structured.descriptionChunks': descriptionChunks
         });
 
-        // 6. Vector Storage
-        console.log(`[INGEST] Generating embeddings and storing in Vector DB...`);
+        await updateIngestionStatus(ipId, 'CLAIMS_PROCESSED');
 
-        // Store Abstract vector
+        /* =========================
+           STEP 5 — DIAGRAM INTELLIGENCE
+        ========================= */
+
+        const structuredDiagrams = [];
+
+        await Promise.all(diagramImages.map(async (img) => {
+            if (!img.secure_url) return;
+
+            const imgBuffer = await fetch(img.secure_url);
+            const intelligence = await analyzeDiagram(imgBuffer);
+
+            structuredDiagrams.push({
+                diagramId: img.page,
+                type: intelligence.type || 'unknown',
+                representation: intelligence.representation || {},
+                semanticSummary: intelligence.semanticSummary || '',
+                confidence: intelligence.confidence || 0
+            });
+        }));
+
+        await IP.findByIdAndUpdate(ipId, {
+            'ingestion.structured.diagrams': structuredDiagrams
+        });
+
+        await updateIngestionStatus(ipId, 'DIAGRAMS_PROCESSED');
+
+        /* =========================
+           STEP 6 — VECTOR STORAGE (QDRANT)
+        ========================= */
+
+
+        // ABSTRACT
         if (abstractText) {
-            await storeVector(ipId, 'ABSTRACT', abstractText, { ipcClass });
+            await storeVector(
+                abstractText,
+                buildPayload({
+                    ipId: ipId.toString(),
+                    type: 'ABSTRACT',
+                    ipcClass,
+                    ingestionVersion,
+                    embeddingVersion: EMBEDDING_VERSION
+                }),
+                'ABSTRACT'
+            );
+
         }
 
-        // Store Claim vectors (expanded)
+        // CLAIMS
         if (expandedClaims.length > 0) {
+            const claimPayloads = expandedClaims.map(c =>
+                buildPayload({
+                    ipId: ipId.toString(),
+                    type: 'CLAIM',
+                    ipcClass,
+                    ingestionVersion,
+                    embeddingVersion: EMBEDDING_VERSION,
+                    claimNo: c.claimNo
+                })
+            );
+
             await storeBatchVectors(
-                ipId,
-                'CLAIM',
                 expandedClaims.map(c => c.expandedText),
-                expandedClaims.map(c => ({ claimNo: c.claimNo, ipcClass }))
+                claimPayloads,
+                'CLAIM'
             );
+
         }
 
-        // Store Description Chunks
+        // DESCRIPTION
         if (descriptionChunks.length > 0) {
-            await storeBatchVectors(
-                ipId,
-                'DESCRIPTION',
-                descriptionChunks,
-                descriptionChunks.map((_, i) => ({ chunkIndex: i, ipcClass }))
+            const descPayloads = descriptionChunks.map(c =>
+                buildPayload({
+                    ipId: ipId.toString(),
+                    type: 'DESCRIPTION',
+                    ipcClass,
+                    ingestionVersion,
+                    embeddingVersion: EMBEDDING_VERSION,
+                    chunkId: c.chunkId
+                })
             );
+
+            await storeBatchVectors(
+                descriptionChunks.map(c => c.text),
+                descPayloads,
+                'DESCRIPTION'
+            );
+
         }
 
-        // Store Diagram Summaries
-        if (structuredDiagrams.length > 0) {
-            await storeBatchVectors(
-                ipId,
-                'DIAGRAM',
-                structuredDiagrams.map(d => d.semanticSummary),
-                structuredDiagrams.map((_, i) => ({ diagramPage: i + 1, ipcClass }))
+        // DIAGRAMS (confidence-gated)
+        const validDiagrams = structuredDiagrams.filter(
+            d => d.confidence >= DIAGRAM_CONFIDENCE_THRESHOLD && d.semanticSummary
+        );
+
+        if (validDiagrams.length > 0) {
+            const diagramPayloads = validDiagrams.map(d =>
+                buildPayload({
+                    ipId: ipId.toString(),
+                    type: 'DIAGRAM',
+                    ipcClass,
+                    ingestionVersion,
+                    embeddingVersion: EMBEDDING_VERSION,
+                    diagramId: d.diagramId
+                })
             );
+
+            await storeBatchVectors(
+                validDiagrams.map(d => d.semanticSummary),
+                diagramPayloads,
+                'DIAGRAM'
+            );
+
         }
 
-        console.log(`[SUCCESS] IP ${ipId} ingestion complete`);
-    } catch (error) {
-        console.error(`[ERROR] Ingest failed for ${ipId}:`, error);
+        await updateIngestionStatus(ipId, 'INDEXED');
+
+        console.log(`[INGEST SUCCESS] IP ${ipId} fully ingested`);
+
+    } catch (err) {
+        console.error(`[INGEST FAILED] IP ${ipId}`, err);
         await updateIngestionStatus(ipId, 'FAILED');
+        throw err;
     }
 }

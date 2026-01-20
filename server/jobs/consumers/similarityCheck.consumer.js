@@ -1,90 +1,260 @@
-import IP, { updateIngestionStatus } from '../../models/ip.model.js';
+import IP from '../../models/ip.model.js';
+import { SimilaritySnapshot } from '../../models/similaritySnapshot.model.js';
+
 import { findSimilarCandidates } from '../../services/vector/similaritySearch.service.js';
 import { runAgenticComparison } from '../../services/ai/analysisAgent.service.js';
 import { generateRationale } from '../../services/ai/rationaleGenerator.service.js';
+import { ACTIVE_EMBEDDING } from '../../config/embeddingConfig.js';
 import { logAnalysisMetrics } from '../../services/utils/observability.service.js';
 
-/**
- * Handles the similarity check job.
- * @param {Object} job - The job data containing ipId.
- */
+/* =====================================================
+   FINAL-STATE SIMILARITY CHECK CONSUMER
+===================================================== */
+
 export async function handleSimilarityCheck(job) {
     const startTime = Date.now();
-    const ipId = job.ipId;
+    const { ipId } = job;
 
-    const ip = await IP.findById(ipId);
-    if (!ip) {
-        console.error(`IP ${ipId} not found for similarity check`);
+    const targetIP = await IP.findById(ipId);
+    if (!targetIP) {
+        console.error(`[SIMILARITY] Target IP ${ipId} not found`);
+        return;
+    }
+
+    if (targetIP.ingestion.status !== 'INDEXED') {
+        console.warn(`[SIMILARITY] Target IP ${ipId} not indexed`);
         return;
     }
 
     try {
-        console.log(`[SIMILARITY] Starting search for IP: ${ipId}`);
+        /* =========================
+           STEP 1 — VECTOR DISCOVERY
+        ========================= */
 
-        // 1. Find candidates using Vector Search (Discovery Phase)
         const candidates = await findSimilarCandidates(ipId);
 
-        // 2. Agentic Reasoning (Verification Phase)
-        console.log(`[REASONING] Running agentic deep dive on top 3 candidates...`);
-        const topCandidates = candidates.slice(0, 3);
-        const targetSummary = {
-            title: ip.title,
-            claims: ip.structured.claims.map(c => c.expandedText)
+        const TOP_K = 3;
+        const topCandidates = candidates.slice(0, TOP_K);
+
+        /* =========================
+           STEP 2 — TARGET CONTEXT
+        ========================= */
+
+        const targetContext = {
+            ipId,
+            expandedClaims: targetIP.ingestion.structured.claims.map(c => ({
+                claimNo: c.claimNo,
+                text: c.expandedText
+            }))
         };
+
+        const analyzedCandidates = [];
+
+        /* =========================
+           STEP 3 — AGENTIC ANALYSIS
+        ========================= */
 
         for (const candidate of topCandidates) {
+            const candidateIP = await IP.findById(candidate.ipId, {
+                'ingestion.version': 1
+            });
+
+            if (!candidateIP) continue;
+
+            let agentResult;
+
             try {
-                // Perform deep-dive comparison
-                const analysis = await runAgenticComparison(targetSummary, candidate.ipId);
-                candidate.agentReasoning = analysis.reasoning;
-                candidate.isConflict = analysis.isConflict;
-
-                // Contrastive Rationale Generation
-                console.log(`[RATIONALE] Generating point-by-point comparisons for candidate ${candidate.ipId}...`);
-                for (const match of candidate.matches) {
-                    let sourceContent = "";
-                    if (match.sourceSection === 'CLAIM' && match.metadata?.claimNo) {
-                        const targetClaim = ip.structured.claims.find(c => c.claimNo === match.metadata.claimNo);
-                        sourceContent = targetClaim ? targetClaim.expandedText : "";
-                    } else if (match.sourceSection === 'ABSTRACT') {
-                        sourceContent = ip.raw.abstractText;
-                    }
-
-                    if (sourceContent && match.content) {
-                        const rationaleResult = await generateRationale(sourceContent, match.content);
-                        match.rationale = JSON.stringify(rationaleResult);
-                    }
-                }
-
-                console.log(`[REASONING] Candidate ${candidate.ipId} analyzed. Conflict: ${analysis.isConflict}`);
-            } catch (err) {
-                console.error(`[REASONING ERROR] Failed for candidate ${candidate.ipId}:`, err.message);
-                candidate.agentReasoning = "Reasoning service failed.";
+                agentResult = await runAgenticComparison(
+                    targetContext,
+                    candidate.ipId
+                );
+            } catch {
+                agentResult = {
+                    suggestedConflict: false,
+                    confidence: 0,
+                    claimAnalysis: [],
+                    diagramSupport: { used: false },
+                    reasoning: 'Agentic analysis failed'
+                };
             }
+
+            /* =========================
+               STEP 4 — MATCH RATIONALES
+            ========================= */
+
+            const enrichedMatches = await enrichMatchesWithRationale(
+                targetIP,
+                candidate.matches,
+                candidateIP
+            );
+
+            /* =========================
+               STEP 5 — CONFIDENCE DERIVATION
+            ========================= */
+
+            const confidenceLevel =
+                agentResult.confidence < 0.4
+                    ? 'LOW'
+                    : agentResult.confidence >= 0.7
+                        ? 'HIGH'
+                        : 'MEDIUM';
+
+            /* =========================
+               STEP 6 — SNAPSHOT CREATION
+            ========================= */
+
+            const snapshot = await SimilaritySnapshot.create({
+                targetIP: ipId,
+                comparedIP: candidate.ipId,
+
+                targetIngestionVersion: targetIP.ingestion.version,
+                comparedIngestionVersion: candidateIP.ingestion.version,
+                embeddingVersion: ACTIVE_EMBEDDING.version,
+
+                similarityScore: {
+                    overall: candidate.score,
+                    breakdown: candidate.scoreBreakdown || {}
+                },
+
+                confidenceLevel,
+                confidenceSource: 'SYSTEM',
+
+                explicitLowConfidenceNote:
+                    confidenceLevel === 'LOW'
+                        ? 'Similarity assessment has low confidence due to limited overlap.'
+                        : undefined,
+
+                claimAnalysis: agentResult.claimAnalysis,
+                diagramSupport: agentResult.diagramSupport,
+
+                agentTrace: {
+                    advisoryOutput: agentResult,
+                    retrievedEvidence: enrichedMatches
+                }
+            });
+
+            await IP.findByIdAndUpdate(ipId, {
+                $push: { analysisRefs: snapshot._id }
+            });
+
+            analyzedCandidates.push({
+                ipId: candidate.ipId,
+                advisory: agentResult,
+                similarityScore: candidate.score
+            });
         }
 
-        // 3. Determine final verdict based on candidates
-        const conflictCandidate = topCandidates.find(c => c.isConflict);
-        const finalVerdict = {
-            status: conflictCandidate ? 'CONFLICT' : (topCandidates.length > 0 ? 'POTENTIAL_INFRINGE' : 'CLEAN'),
-            summary: conflictCandidate
-                ? `Conflict detected with IP ${conflictCandidate.ipId}. ${conflictCandidate.agentReasoning?.substring(0, 200) || ''}...`
-                : "No definitive legal conflicts found among top candidates.",
-            confidence: conflictCandidate ? 0.9 : 0.7
-        };
+        /* =========================
+           STEP 7 — FINAL VERDICT (SYSTEM)
+        ========================= */
+
+        const finalVerdict = computeFinalVerdict(analyzedCandidates);
 
         await IP.findByIdAndUpdate(ipId, {
-            'analysis.similarIPs': candidates,
-            'analysis.finalVerdict': finalVerdict,
-            ingestionStatus: 'ANALYZED'
+            'analysis.finalVerdict': finalVerdict
         });
 
-        const duration = Date.now() - startTime;
-        await logAnalysisMetrics(ipId, { duration, outcome: 'SUCCESS' });
+        /* =========================
+           STEP 8 — OBSERVABILITY
+        ========================= */
 
-        console.log(`[SUCCESS] AI Analysis complete for ${ipId}. Verdict: ${finalVerdict.status}`);
+        await logAnalysisMetrics(ipId, {
+            durationMs: Date.now() - startTime,
+            candidateCount: analyzedCandidates.length,
+            verdict: finalVerdict.status
+        });
+
+        console.log(`[SIMILARITY] Completed for IP ${ipId}`);
+
     } catch (error) {
-        console.error(`[ERROR] Similarity/Reasoning failed for ${ipId}:`, error.message);
-        await updateIngestionStatus(ipId, 'FAILED');
+        console.error(`[SIMILARITY FAILED] IP ${ipId}`, error.message);
     }
+}
+
+/* =====================================================
+   HELPERS (PURE & DETERMINISTIC)
+===================================================== */
+
+async function enrichMatchesWithRationale(targetIP, matches = [], candidateIP) {
+    const enriched = [];
+
+    for (const match of matches) {
+        let sourceText = '';
+
+        if (match.sourceSection === 'CLAIM' && match.queryMetadata?.claimNo) {
+            // Use the claimNo from the TARGET'S usage (queryMetadata), not the Candidate's match metadata
+            const claim = targetIP.ingestion.structured.claims.find(
+                c => c.claimNo === match.queryMetadata.claimNo
+            );
+            sourceText = claim?.expandedText || '';
+        }
+
+        if (!sourceText || !match.content) {
+            enriched.push(match);
+            continue;
+        }
+
+        try {
+            let rationale = null;
+            if (match.sourceSection === 'CLAIM' && match.metadata?.claimNo && candidateIP) {
+                const candidateClaim = candidateIP.ingestion.structured.claims.find(
+                    c => c.claimNo === match.metadata.claimNo
+                );
+
+                if (candidateClaim) {
+                    rationale = await generateRationale(
+                        sourceText,                     // TARGET claim
+                        candidateClaim.expandedText     // CANDIDATE claim
+                    );
+                }
+            } else {
+                // Optional supporting rationale
+                rationale = await generateRationale(
+                    sourceText,
+                    match.content
+                );
+            }
+
+
+            enriched.push({
+                ...match,
+                rationale
+            });
+        } catch {
+            enriched.push(match);
+        }
+    }
+
+    return enriched;
+}
+
+function computeFinalVerdict(analyzedCandidates) {
+    if (!analyzedCandidates.length) {
+        return {
+            status: 'CLEAN',
+            confidence: 0.8,
+            summary: 'No similar prior art detected'
+        };
+    }
+
+    const strongConflicts = analyzedCandidates.filter(
+        c => c.advisory.suggestedConflict && c.advisory.confidence >= 0.7
+    );
+
+    if (strongConflicts.length > 0) {
+        return {
+            status: 'CONFLICT',
+            confidence: Math.min(
+                0.95,
+                Math.max(...strongConflicts.map(c => c.advisory.confidence))
+            ),
+            summary: `Potential conflict detected with IP ${strongConflicts[0].ipId}`
+        };
+    }
+
+    return {
+        status: 'POTENTIAL_INFRINGE',
+        confidence: 0.6,
+        summary: 'Similar prior art found; examiner review recommended'
+    };
 }

@@ -1,52 +1,65 @@
 import { QdrantClient } from '@qdrant/js-client-rest';
 import config from './config.js';
 
+export const COLLECTIONS = {
+    ABSTRACT: 'ip_abstract_vectors',
+    CLAIM: 'ip_claim_vectors',
+    DESCRIPTION: 'ip_description_vectors',
+    DIAGRAM: 'ip_diagram_vectors'
+};
+
+export const VECTOR_SIZE = 1536; // text-embedding-3-small
+export const DISTANCE = 'Cosine';
+
 const client = new QdrantClient({
     url: config.QDRANT_URL,
     apiKey: config.QDRANT_API_KEY,
 });
 
-export const COLLECTION_NAME = 'patent_vectors';
+async function ensureCollection(name) {
+    const collections = await client.getCollections();
+    const exists = collections.collections.some(c => c.name === name);
+
+    if (exists) return;
+
+    console.log(`[QDRANT] Creating collection: ${name}`);
+
+    await client.createCollection(name, {
+        vectors: {
+            size: VECTOR_SIZE,
+            distance: DISTANCE,
+        }
+    });
+
+    // Flat payload indexes (IMPORTANT)
+    await client.createPayloadIndex(name, {
+        field_name: 'ipId',
+        field_schema: 'keyword',
+    });
+
+    await client.createPayloadIndex(name, {
+        field_name: 'type',
+        field_schema: 'keyword',
+    });
+
+    await client.createPayloadIndex(name, {
+        field_name: 'ipcClass',
+        field_schema: 'keyword',
+    });
+}
 
 /**
- * Initializes the Qdrant collection if it doesn't exist.
+ * Call once at app startup
  */
 export async function initializeQdrant() {
     try {
-        const collections = await client.getCollections();
-        const exists = collections.collections.some(c => c.name === COLLECTION_NAME);
-
-        if (!exists) {
-            console.log(`[QDRANT] Creating collection: ${COLLECTION_NAME}`);
-            await client.createCollection(COLLECTION_NAME, {
-                vectors: {
-                    size: 1536, // Dimensions for Google's embedding-001
-                    distance: 'Cosine',
-                },
-                optimizers_config: {
-                    default_segment_number: 2,
-                },
-                replication_factor: 2,
-            });
-
-            // Create payload index for IPC filtering
-            await client.createPayloadIndex(COLLECTION_NAME, {
-                field_name: 'metadata.ipcClass',
-                field_schema: 'keyword',
-            });
-
-            await client.createPayloadIndex(COLLECTION_NAME, {
-                field_name: 'section',
-                field_schema: 'keyword',
-            });
-
-            await client.createPayloadIndex(COLLECTION_NAME, {
-                field_name: 'patentId',
-                field_schema: 'keyword',
-            });
+        for (const name of Object.values(COLLECTIONS)) {
+            await ensureCollection(name);
         }
-    } catch (error) {
-        console.error('[QDRANT] Initialization failed:', error.message);
+        console.log('[QDRANT] All collections ready');
+    } catch (err) {
+        console.error('[QDRANT] Initialization failed:', err.message);
+        throw err;
     }
 }
 

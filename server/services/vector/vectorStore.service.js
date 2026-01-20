@@ -1,72 +1,104 @@
-import qdrantClient, { COLLECTION_NAME } from '../../utils/qdrantClient.js';
+import { ACTIVE_EMBEDDING } from '../../utils/embeddingConfig.js';
+import qdrantClient from '../../utils/qdrantClient.js';
 import { generateEmbedding, generateBatchEmbeddings } from './embedding.service.js';
 import { v4 as uuidv4 } from 'uuid';
 
 /**
- * Stores a vector in Qdrant.
+ * Vector collections (DO NOT MERGE THESE)
  */
-export async function storeVector(patentId, section, content, metadata = {}) {
-    try {
+const COLLECTIONS = {
+    ABSTRACT: 'ip_abstract_vectors',
+    CLAIM: 'ip_claim_vectors',
+    DESCRIPTION: 'ip_description_vectors',
+    DIAGRAM: 'ip_diagram_vectors'
+};
 
-        console.log("[DEBUG] storeVector called for patentId: ", patentId, " and section: ", section, "and content : ", content);
-        const embedding = await generateEmbedding(content);
-
-        console.log("[DEBUG] Abstract embedding : ", embedding)
-        const vector = embedding?.data?.[0]?.embedding;
-
-        console.log("[DEBUG] Abstract vectors", vector)
-
-        if (!vector) return null;
-
-
-        return await qdrantClient.upsert(COLLECTION_NAME, {
-            wait: true,
-            points: [{
-                id: uuidv4(),
-                vector,
-                payload: {
-                    patentId: patentId.toString(),
-                    section,
-                    content,
-                    metadata: {
-                        ...metadata,
-                        embeddingVersion: 'v1-google-genai'
-                    }
-                }
-            }]
-        });
-    } catch (error) {
-        console.error(`[QDRANT] Failed to store vector for ${section}:`, error.message);
-    }
+/**
+ * Base payload builder (flat & filterable)
+ */
+export function buildPayload({
+    ipId,
+    type,
+    ipcClass,
+    embeddingVersion,
+    ingestionVersion,
+    claimNo,
+    chunkId,
+    diagramId
+}) {
+    return {
+        ipId,
+        type,
+        ipcClass,
+        embeddingVersion,
+        ingestionVersion,
+        claimNo,
+        chunkId,
+        diagramId
+    };
 }
 
 /**
- * Stores multiple vectors in Qdrant.
+ * Store a single vector
  */
-export async function storeBatchVectors(patentId, section, contents, metadatas = []) {
-    if (!contents || contents.length === 0) return;
+export async function storeVector(text, payload, collectionType) {
+    if (!text || !collectionType) return;
 
-    try {
-        const embeddings = await generateBatchEmbeddings(contents);
-        const points = contents.map((content, i) => ({
-            id: uuidv4(),
-            vector: embeddings[i],
-            payload: {
-                patentId: patentId.toString(),
-                section,
-                content,
-                metadata: {
-                    ...(metadatas[i] || {}),
-                    embeddingVersion: 'v1-google-genai'
-                }
-            }
-        }));
+    const embedding = await generateEmbedding(text);
+    const vector = embedding?.data?.[0]?.embedding;
 
-        return await qdrantClient.upsert(COLLECTION_NAME, {
-            wait: true,
-            points
-        });
-    } catch (error) {
-        console.error(`[QDRANT] Failed to store batch vectors for ${section}:`, error.message);
+    if (!vector) {
+        throw new Error('Embedding generation failed');
     }
+
+    const collection = COLLECTIONS[collectionType];
+    if (!collection) {
+        throw new Error(`Invalid collection type: ${collectionType}`);
+    }
+
+    return qdrantClient.upsert(collection, {
+        wait: true,
+        points: [{
+            id: uuidv4(),
+            vector,
+            payload: {
+                ...payload,
+                embeddingModel: ACTIVE_EMBEDDING.model,
+                embeddingVersion: ACTIVE_EMBEDDING.version
+            }
+        }]
+    });
+}
+
+/**
+ * Store multiple vectors safely
+ */
+export async function storeBatchVectors(texts, payloads, collectionType) {
+    if (!texts || texts.length === 0) return;
+
+    const embeddings = await generateBatchEmbeddings(texts);
+
+    if (!embeddings || embeddings.length !== texts.length) {
+        throw new Error('Batch embedding count mismatch');
+    }
+
+    const collection = COLLECTIONS[collectionType];
+    if (!collection) {
+        throw new Error(`Invalid collection type: ${collectionType}`);
+    }
+
+    const points = embeddings.map((vector, i) => ({
+        id: uuidv4(),
+        vector,
+        payload: {
+            ...payloads[i],
+            embeddingModel: ACTIVE_EMBEDDING.model,
+            embeddingVersion: ACTIVE_EMBEDDING.version
+        }
+    }));
+
+    return qdrantClient.upsert(collection, {
+        wait: true,
+        points
+    });
 }

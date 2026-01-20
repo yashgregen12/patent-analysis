@@ -1,4 +1,5 @@
 import IP from '../models/ip.model.js';
+import { SimilaritySnapshot } from '../models/similaritySnapshot.model.js';
 
 /**
  * Get full analysis for an IP
@@ -6,7 +7,7 @@ import IP from '../models/ip.model.js';
 export const getAnalysisByIpId = async (req, res) => {
     try {
         const { ipId } = req.params;
-        const ip = await IP.findById(ipId);
+        const ip = await IP.findById(ipId).populate('analysisRefs');
 
         if (!ip) {
             return res.status(404).json({ success: false, message: 'IP not found' });

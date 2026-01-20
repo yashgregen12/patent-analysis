@@ -8,7 +8,7 @@ export const getApprovedIPs = async (req, res) => {
     try {
         const ips = await IP.find({ currentStatus: 'granted' })
             .select('title preambleToDescription abstract createdAt')
-            .populate('creator', 'users')
+            .populate('creator', 'name')
             .lean();
 
         return res.status(200).json({ success: true, data: ips });
@@ -27,7 +27,7 @@ export const getApprovedIPById = async (req, res) => {
 
         const ip = await IP.findOne({ _id: id, currentStatus: 'granted' })
             .select('title preambleToDescription abstract description claims diagrams createdAt')
-            .populate('creator', 'users')
+            .populate('creator', 'name')
             .lean();
 
         if (!ip) {

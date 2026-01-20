@@ -1,79 +1,156 @@
-import { createAgent, providerStrategy } from "langchain";
+import { createAgent, providerStrategy, tool } from "langchain";
 import { z } from "zod";
+import IP from "../../models/ip.model.js";
 
-// Structured Output Schema for Rationales
-const RationaleSchema = z.object({
-    overlaps: z.array(z.object({
-        element: z.string().describe("The overlapping element or concept"),
-        explanation: z.string().describe("Why this is considered an overlap"),
-    })).describe("List of identified overlaps between target and candidate"),
-    distinctions: z.array(z.object({
-        element: z.string().describe("The distinguishing element or concept"),
-        explanation: z.string().describe("Why this is different"),
-    })).describe("List of key distinctions between target and candidate"),
-    overallAssessment: z.enum(["HIGH_OVERLAP", "PARTIAL_OVERLAP", "LOW_OVERLAP", "NO_OVERLAP"]),
-    summary: z.string().describe("Concise technical summary of the comparison"),
+/* =====================================================
+   STRUCTURED ADVISORY OUTPUT (SNAPSHOT-ALIGNED)
+===================================================== */
+
+export const AdvisoryAnalysisSchema = z.object({
+    suggestedConflict: z.boolean(),
+
+    confidence: z.number().min(0).max(1),
+
+    claimAnalysis: z.array(
+        z.object({
+            targetClaim: z.number(),
+            sourceClaims: z.array(z.number()),
+            matchType: z.enum(["SINGLE", "COMBINED"]),
+            rationale: z.string()
+        })
+    ),
+
+    diagramSupport: z.object({
+        used: z.boolean(),
+        explanation: z.string().optional()
+    }),
+
+    reasoning: z.string()
 });
 
-/**
- * Generates a structured contrastive rationale between a target fragment and a candidate fragment.
- * @param {string} targetText - The text of the target patent (e.g., a claim).
- * @param {string} candidateText - The text of the candidate prior art.
- * @returns {Promise<Object>} - The structured rationale object.
- */
-export async function generateRationale(targetText, candidateText) {
-    if (!targetText || !candidateText) {
-        return {
-            overlaps: [],
-            distinctions: [],
-            overallAssessment: "NO_OVERLAP",
-            summary: "Insufficient text for comparison."
-        };
-    }
+/* =====================================================
+   TOOL: FETCH CANDIDATE CLAIMS ONLY
+===================================================== */
 
+const getCandidateClaimsTool = tool(
+    async ({ ipId }) => {
+        const ip = await IP.findById(ipId);
+        if (!ip) {
+            return { error: "Candidate IP not found" };
+        }
+
+        return {
+            title: ip.title,
+            claims: (ip.ingestion?.structured?.claims || []).map(c => ({
+                claimNo: c.claimNo,
+                text: c.expandedText
+            }))
+        };
+    },
+    {
+        name: "get_candidate_claims",
+        description: "Fetch expanded claims of a candidate patent for claim-to-claim comparison",
+        schema: z.object({ ipId: z.string() })
+    }
+);
+
+const tools = [getCandidateClaimsTool];
+
+/* =====================================================
+   SYSTEM PROMPT (FINAL, LOCKED)
+===================================================== */
+
+const SYSTEM_PROMPT = `
+You are an AI assistant supporting a human patent examiner.
+
+STRICT RULES:
+- You are NOT a legal authority.
+- You provide ADVISORY analysis only.
+- Focus STRICTLY on CLAIM-TO-CLAIM comparison.
+- Ignore descriptions unless required for clarification.
+- Ignore diagrams unless explicitly relevant.
+
+ANTICIPATION STANDARD:
+- A claim is anticipated ONLY if all essential elements are present.
+- Partial overlap does NOT count.
+
+CONFIDENCE CALIBRATION:
+- If uncertain, confidence MUST be below 0.6.
+- Use confidence above 0.7 ONLY if anticipation is clear.
+
+OUTPUT REQUIREMENTS:
+- Output structured data ONLY.
+- Every anticipated claim MUST include:
+  - targetClaim
+  - sourceClaims
+  - matchType
+  - rationale
+- Be concise, technical, and factual.
+`;
+
+/* =====================================================
+   MAIN COMPARISON FUNCTION
+===================================================== */
+
+export async function runAgenticComparison(targetContext, candidateIpId) {
     try {
         const agent = createAgent({
             model: "groq:llama-3.3-70b-versatile",
-            responseFormat: providerStrategy(RationaleSchema),
+            tools,
+            responseFormat: providerStrategy(AdvisoryAnalysisSchema),
+            temperature: 0
         });
 
         const result = await agent.invoke({
             messages: [
-                {
-                    role: "system",
-                    content: "You are a patent examiner analyzing technical similarities between patent claims. Provide a structured comparison."
-                },
+                { role: "system", content: SYSTEM_PROMPT },
                 {
                     role: "user",
-                    content: `Compare the following two patent fragments:
+                    content: `
+TARGET PATENT CLAIMS:
+${JSON.stringify(targetContext.expandedClaims)}
 
-TARGET FRAGMENT:
-"${targetText}"
+CANDIDATE PATENT ID:
+${candidateIpId}
 
-CANDIDATE FRAGMENT (Potential Prior Art):
-"${candidateText}"
-
-Provide a structured analysis of overlaps and distinctions.`
+Analyze whether any TARGET claim is anticipated by the CANDIDATE.
+Provide claim-level structured analysis.
+`
                 }
             ]
         });
 
-        return result.structuredResponse || {
-            overlaps: [],
-            distinctions: [],
-            overallAssessment: "LOW_OVERLAP",
-            summary: "No structured response returned"
-        };
-    } catch (error) {
-        console.error("[RATIONALE] Generation Error:", error.message);
+        const advisory = result.structuredResponse;
+
+        /* =====================================================
+           POST-VALIDATION (HALLUCINATION SAFETY)
+        ===================================================== */
+
+        const validTargetClaims = new Set(
+            targetContext.expandedClaims.map(c => c.claimNo)
+        );
+
+        const sanitizedClaimAnalysis = advisory.claimAnalysis.filter(
+            ca => validTargetClaims.has(ca.targetClaim)
+        );
+
         return {
-            overlaps: [],
-            distinctions: [],
-            overallAssessment: "NO_OVERLAP",
-            summary: "Failed to generate detailed rationale: " + error.message
+            suggestedConflict: advisory.suggestedConflict,
+            confidence: advisory.confidence,
+            claimAnalysis: sanitizedClaimAnalysis,
+            diagramSupport: advisory.diagramSupport,
+            reasoning: advisory.reasoning
+        };
+
+    } catch (error) {
+        console.error("[AGENTIC ANALYSIS FAILED]", error.message);
+
+        return {
+            suggestedConflict: false,
+            confidence: 0,
+            claimAnalysis: [],
+            diagramSupport: { used: false },
+            reasoning: "Advisory analysis failed or was inconclusive."
         };
     }
 }
-
-// Export schema for use in other services
-export { RationaleSchema };

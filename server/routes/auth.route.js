@@ -44,7 +44,7 @@ router.get("/me", authMiddleware, (req, res) => {
     });
 });
 
-// Logout routeq
+// Logout route
 router.get("/logout", authMiddleware, logoutUser);
 
 export default router;

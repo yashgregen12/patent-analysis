@@ -18,26 +18,31 @@ export async function extractImages(pdfBuffer) {
         const extractedImages = [];
 
         for (let i = 0; i < pageCount; i++) {
-            const page = doc.loadPage(i);
-            const pixmap = page.toPixmap(mupdf.Matrix.identity, mupdf.ColorSpace.deviceRGB, false);
-            const pngBuffer = pixmap.asPNG();
+            try {
+                const page = doc.loadPage(i);
+                const matrix = mupdf.Matrix.scale(2, 2);
+                const pixmap = page.toPixmap(matrix, mupdf.ColorSpace.deviceRGB, false);
+                const pngBuffer = pixmap.asPNG();
 
-            // 2. Save temporarily to disk for Cloudinary upload (uploadToCloudinary expects a path)
-            const tempPath = path.join(os.tmpdir(), `diagram_${uuidv4()}.png`);
-            await fs.writeFile(tempPath, pngBuffer);
+                // 2. Save temporarily to disk for Cloudinary upload (uploadToCloudinary expects a path)
+                const tempPath = path.join(os.tmpdir(), `diagram_${uuidv4()}.png`);
+                await fs.writeFile(tempPath, pngBuffer);
 
-            // 3. Upload to Cloudinary
-            const uploadResult = await uploadToCloudinary(tempPath);
+                // 3. Upload to Cloudinary
+                const uploadResult = await uploadToCloudinary(tempPath);
 
-            extractedImages.push({
-                page: i + 1,
-                imageRef: `page_${i + 1}`,
-                secure_url: uploadResult.secure_url,
-                public_id: uploadResult.public_id
-            });
+                extractedImages.push({
+                    page: i + 1,
+                    imageRef: `page_${i + 1}`,
+                    secure_url: uploadResult.secure_url,
+                    public_id: uploadResult.public_id
+                });
 
-            // 4. Cleanup temp file
-            await fs.unlink(tempPath);
+                // 4. Cleanup temp file
+                await fs.unlink(tempPath);
+            } catch (err) {
+                console.warn(`[DIAGRAM] Failed page ${i + 1}:`, err.message);
+            }
         }
 
         return extractedImages;

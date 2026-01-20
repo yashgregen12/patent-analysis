@@ -19,7 +19,7 @@ export const loginApplicant = async (req, res) => {
             applicationNumber: applicationNumber,
             email: email
         });
-
+ 
         if (!user) {
             return res.status(401).json({ message: "Invalid credentials. Please check your application number and email." });
         }

@@ -1,35 +1,29 @@
 export function extractDependencies(claimText) {
-    const deps = new Set();
-    // Match patterns like "claim 1", "claims 1 and 2", "claims 1-3", "claim 1, 2, or 3"
-    const regex = /claim[s]?\s+([\d,\s\---toandor]+)/gi;
+  if (!claimText) return [];
 
-    let match;
-    while ((match = regex.exec(claimText)) !== null) {
-        const potentialContent = match[1];
+  const deps = new Set();
 
-        // Handle ranges like 1-5 or 1 to 5
-        const rangeMatch = potentialContent.match(/(\d+)\s*(?:\-|–|—|to)\s*(\d+)/i);
-        if (rangeMatch) {
-            const start = parseInt(rangeMatch[1], 10);
-            const end = parseInt(rangeMatch[2], 10);
-            if (!isNaN(start) && !isNaN(end)) {
-                for (let i = start; i <= end; i++) deps.add(i);
-            }
-        }
+  const regex = /claim[s]?\s+((?:\d+\s*(?:-|–|—|to)?\s*\d*|\d+)(?:\s*(?:,|and|or)\s*(?:\d+\s*(?:-|–|—|to)?\s*\d*|\d+))*)/gi;
 
-        // Handle lists like 1, 2, 3
-        const numbers = potentialContent.match(/\d+/g);
-        if (numbers) {
-            numbers.forEach(num => deps.add(parseInt(num, 10)));
-        }
+  let match;
+  while ((match = regex.exec(claimText)) !== null) {
+    const part = match[1];
+
+    // ranges
+    const rangeRegex = /(\d+)\s*(?:-|–|—|to)\s*(\d+)/gi;
+    let r;
+    while ((r = rangeRegex.exec(part)) !== null) {
+      const start = parseInt(r[1], 10);
+      const end = parseInt(r[2], 10);
+      for (let i = start; i <= end; i++) deps.add(i);
     }
 
-    // A claim cannot depend on itself
-    const claimNoMatch = claimText.match(/^\d+/);
-    if (claimNoMatch) {
-        const currentNo = parseInt(claimNoMatch[0], 10);
-        deps.delete(currentNo);
+    // single numbers
+    const nums = part.match(/\b\d+\b/g);
+    if (nums) {
+      nums.forEach(n => deps.add(parseInt(n, 10)));
     }
+  }
 
-    return Array.from(deps).sort((a, b) => a - b);
+  return Array.from(deps).sort((a, b) => a - b);
 }

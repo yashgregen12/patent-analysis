@@ -8,6 +8,11 @@
 export function chunkDescription(text, maxWords = 400, overlap = 50) {
     if (!text) return [];
 
+    // Guard against misuse
+    if (/^\s*\d+\./m.test(text)) {
+        throw new Error('Claims must not be chunked');
+    }
+
     // Split by sentences or paragraphs for more semantic chunking
     // Here we split by paragraphs first
     const paragraphs = text.split(/\n\s*\n/);
@@ -31,8 +36,6 @@ export function chunkDescription(text, maxWords = 400, overlap = 50) {
         currentChunk.push(...paraWords);
         currentWordCount += paraWords.length;
 
-        // If a single paragraph is larger than maxWords, we just let it be for now 
-        // to keep logic simple, or we could split it. Let's split it.
         while (currentWordCount > maxWords) {
             chunks.push(currentChunk.slice(0, maxWords).join(' '));
             currentChunk = currentChunk.slice(maxWords - overlap);

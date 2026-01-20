@@ -2,105 +2,157 @@ import { createAgent, providerStrategy, tool } from "langchain";
 import { z } from "zod";
 import IP from "../../models/ip.model.js";
 
-// Structured Output Schema
-const AnalysisResultSchema = z.object({
-    isConflict: z.boolean().describe("Whether a legal conflict exists"),
-    reasoning: z.string().describe("Detailed legal-technical explanation of the finding"),
-    confidence: z.number().min(0).max(1).describe("Confidence score from 0 to 1"),
-    verdict: z.enum(["CLEAN", "POTENTIAL_INFRINGE", "CONFLICT"]).describe("Final verdict"),
-    anticipatedClaims: z.array(z.number()).optional().describe("List of claim numbers that are anticipated"),
+/* =====================================================
+   STRUCTURED ADVISORY OUTPUT
+   (DIRECTLY MAPS TO SNAPSHOT)
+===================================================== */
+
+export const AdvisoryAnalysisSchema = z.object({
+    suggestedConflict: z.boolean(),
+
+    confidence: z.number().min(0).max(1),
+
+    claimAnalysis: z.array(
+        z.object({
+            targetClaim: z.number(),
+            sourceClaims: z.array(z.number()),
+            matchType: z.enum(["SINGLE", "COMBINED"]),
+            rationale: z.string()
+        })
+    ),
+
+    diagramSupport: z.object({
+        used: z.boolean(),
+        explanation: z.string().optional()
+    }),
+
+    reasoning: z.string()
 });
 
-// Tool for fetching IP details
-const getIPDetailsTool = tool(
-    async ({ ipId }) => {
-        try {
-            const ip = await IP.findById(ipId);
-            if (!ip) return "IP not found.";
+/* =====================================================
+   TOOL — FETCH CANDIDATE CLAIMS ONLY
+===================================================== */
 
-            return {
-                title: ip.title,
-                claims: (ip.structured?.claims || []).map(
-                    (c) => `Claim ${c.claimNo}: ${c.expandedText}`
-                ),
-                descriptionChunks: (ip.structured?.descriptionChunks || []).slice(0, 5),
-                diagramSummaries: (ip.structured?.diagrams || []).map(
-                    (d) => d.semanticSummary
-                ),
-            };
-        } catch (error) {
-            return `Error fetching details: ${error.message}`;
+const getCandidateClaimsTool = tool(
+    async ({ ipId }) => {
+        const ip = await IP.findById(ipId);
+        if (!ip) {
+            return { error: "Candidate IP not found" };
         }
+
+        return {
+            title: ip.title,
+            claims: (ip.ingestion?.structured?.claims || []).map(c => ({
+                claimNo: c.claimNo,
+                text: c.expandedText
+            }))
+        };
     },
     {
-        name: "get_ip_details",
-        description: "Fetch full structured data for an IP ID, including claims and description chunks.",
+        name: "get_candidate_claims",
+        description: "Fetch expanded claims of a candidate patent for claim-to-claim comparison",
         schema: z.object({
-            ipId: z.string().describe("ID of the candidate IP to fetch details for"),
-        }),
+            ipId: z.string()
+        })
     }
 );
 
-const tools = [getIPDetailsTool];
+const tools = [getCandidateClaimsTool];
 
-const SYSTEM_PROMPT = `You are a Senior Patent Examiner AI. Your task is to compare a TARGET patent application against a CANDIDATE prior art patent and determine if there is a conflict.
+/* =====================================================
+   SYSTEM PROMPT (FINAL, LOCKED)
+===================================================== */
 
-INSTRUCTIONS:
-1. Identify the core inventive step of the TARGET patent.
-2. Use 'get_ip_details' to drill down into the CANDIDATE if the summary provided is insufficient.
-3. Determine if any claim in the TARGET is fully anticipated or made obvious by the CANDIDATE.
-4. After your analysis, provide your final structured result.`;
+const SYSTEM_PROMPT = `
+You are an AI assistant supporting a human patent examiner.
 
-/**
- * Performs a deep agentic comparison between a target patent content and a candidate ID.
- * Returns a structured analysis result.
- */
-export async function runAgenticComparison(targetContent, candidateId) {
+RULES (MANDATORY):
+- You are NOT a legal authority.
+- You provide ADVISORY analysis only.
+- Focus STRICTLY on CLAIM-TO-CLAIM comparison.
+- Ignore descriptions unless required for clarification.
+- Ignore diagrams unless explicitly relevant.
+
+ANTICIPATION STANDARD:
+- A claim is anticipated ONLY if all essential elements are present.
+- Partial overlap does NOT count as anticipation.
+
+CONFIDENCE CALIBRATION:
+- If uncertain, keep confidence BELOW 0.6.
+- Use confidence ABOVE 0.7 ONLY if anticipation is clear.
+
+OUTPUT RULES:
+- Output structured data ONLY.
+- List ONLY valid TARGET claim numbers.
+- Be technical, concise, and factual.
+`;
+
+/* =====================================================
+   MAIN ANALYSIS FUNCTION
+===================================================== */
+
+export async function runAgenticComparison(
+    targetContext,
+    candidateIpId
+) {
     try {
         const agent = createAgent({
             model: "groq:llama-3.3-70b-versatile",
             tools,
-            responseFormat: providerStrategy(AnalysisResultSchema),
+            responseFormat: providerStrategy(AdvisoryAnalysisSchema),
+            temperature: 0
         });
 
         const result = await agent.invoke({
             messages: [
-                {
-                    role: "system",
-                    content: SYSTEM_PROMPT,
-                },
+                { role: "system", content: SYSTEM_PROMPT },
                 {
                     role: "user",
-                    content: `Compare the following:
+                    content: `
+TARGET PATENT CLAIMS:
+${JSON.stringify(targetContext.expandedClaims)}
 
-Target Patent Content: ${JSON.stringify(targetContent)}
+CANDIDATE PATENT ID:
+${candidateIpId}
 
-Candidate IP ID: ${candidateId}
-
-Analyze and provide your structured verdict.`,
-                },
-            ],
+Identify whether any TARGET claim is anticipated by the CANDIDATE.
+Return claim-level analysis.
+`
+                }
+            ]
         });
 
-        // Return structured response from agent
-        return result.structuredResponse || {
-            isConflict: false,
-            reasoning: "No structured response returned",
-            confidence: 0.5,
-            verdict: "POTENTIAL_INFRINGE",
-            anticipatedClaims: []
-        };
-    } catch (error) {
-        console.error("[AGENT] Comparison Error:", error.message);
+        const advisory = result.structuredResponse;
+
+        /* =====================================================
+           POST-VALIDATION (ANTI-HALLUCINATION)
+        ===================================================== */
+
+        const validTargetClaims = new Set(
+            targetContext.expandedClaims.map(c => c.claimNo)
+        );
+
+        const sanitizedClaimAnalysis = advisory.claimAnalysis.filter(
+            ca => validTargetClaims.has(ca.targetClaim)
+        );
+
         return {
-            isConflict: false,
-            reasoning: "Analysis service failed: " + error.message,
+            suggestedConflict: advisory.suggestedConflict,
+            confidence: advisory.confidence,
+            claimAnalysis: sanitizedClaimAnalysis,
+            diagramSupport: advisory.diagramSupport,
+            reasoning: advisory.reasoning
+        };
+
+    } catch (error) {
+        console.error("[AGENTIC ANALYSIS FAILED]", error.message);
+
+        return {
+            suggestedConflict: false,
             confidence: 0,
-            verdict: "CLEAN",
-            anticipatedClaims: []
+            claimAnalysis: [],
+            diagramSupport: { used: false },
+            reasoning: "Advisory analysis failed or was inconclusive."
         };
     }
 }
-
-// Export the schema for use in other services
-export { AnalysisResultSchema };
